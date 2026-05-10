@@ -4,22 +4,22 @@ import torchaudio
 from dataclasses import dataclass
 from torch.utils.data import Dataset, DataLoader
 from transformers import WhisperForConditionalGeneration, WhisperProcessor, get_linear_schedule_with_warmup, Adafactor
-from peft import LoraConfig, get_peft_model
+from accelerate import Accelerator
 from tqdm import tqdm
 import evaluate
 
-MODEL_ID      = "openai/whisper-small"
+MODEL_ID      = "/workspace/whisper_nepali/models/exp3_whisper_small_cleaned/best_model"
 CLEANED_DIR   = "/workspace/whisper_nepali/data/cleaned"
 AUDIO_DIR     = "/workspace/whisper_nepali/data/raw/asr_nepali/data"
-OUTPUT_DIR    = "/workspace/whisper_nepali/models/exp5_whisper_small_lora"
+OUTPUT_DIR    = "/workspace/whisper_nepali/models/exp3_whisper_small_cleaned"
+MODEL_ID      = "/workspace/whisper_nepali/models/exp3_whisper_small_cleaned/best_model"
 SAMPLE_RATE   = 16000
 BATCH_SIZE    = 16
-LEARNING_RATE = 1e-4
-NUM_EPOCHS    = 5
+LEARNING_RATE = 1e-5
+NUM_EPOCHS    = 1
 WARMUP_STEPS  = 500
 LANGUAGE      = "nepali"
 TASK          = "transcribe"
-DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 class NepaliASRDataset(Dataset):
@@ -55,31 +55,28 @@ class DataCollator:
         return {"input_features": input_features, "labels": padded}
 
 def main():
-    print("=" * 60)
-    print("Exp 5 - LoRA Fine-tune Whisper Small")
-    print(f"Device: {DEVICE} | Batch: {BATCH_SIZE} | Epochs: {NUM_EPOCHS}")
-    print("=" * 60)
+    accelerator = Accelerator(mixed_precision="fp16")
+    accelerator.print("=" * 60)
+    accelerator.print("Exp 3 — Fine-tune Whisper Small (Cleaned Data)")
+    accelerator.print(f"Batch/GPU: {BATCH_SIZE} | Epochs: {NUM_EPOCHS}")
+    accelerator.print("=" * 60)
 
     processor = WhisperProcessor.from_pretrained(MODEL_ID, language=LANGUAGE, task=TASK)
     model     = WhisperForConditionalGeneration.from_pretrained(MODEL_ID)
     model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(language=LANGUAGE, task=TASK)
     model.config.suppress_tokens    = []
 
-    lora_config = LoraConfig(r=32, lora_alpha=64, target_modules=["q_proj", "v_proj"], lora_dropout=0.05, bias="none")
-    model = get_peft_model(model, lora_config)
-    model = model.to(DEVICE)
-    print(f"Trainable: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
-
     collator     = DataCollator(processor=processor)
     train_ds     = NepaliASRDataset(os.path.join(CLEANED_DIR, "train.tsv"), AUDIO_DIR, processor)
     val_ds       = NepaliASRDataset(os.path.join(CLEANED_DIR, "val.tsv"),   AUDIO_DIR, processor)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collator, num_workers=4)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, collate_fn=collator, num_workers=4)
-    print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collator, num_workers=4, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, collate_fn=collator, num_workers=4, pin_memory=True)
+    accelerator.print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
 
     optimizer   = Adafactor(model.parameters(), scale_parameter=False, relative_step=False, warmup_init=False, lr=LEARNING_RATE)
     total_steps = len(train_loader) * NUM_EPOCHS
     scheduler   = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=total_steps)
+    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(model, optimizer, train_loader, val_loader, scheduler)
 
     wer_metric  = evaluate.load("wer")
     best_wer    = float("inf")
@@ -90,12 +87,10 @@ def main():
         total_loss = 0
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}")
         for batch in progress:
-            input_features = batch["input_features"].to(DEVICE)
-            labels         = batch["labels"].to(DEVICE)
-            outputs = model(input_features=input_features, labels=labels)
+            outputs = model(input_features=batch["input_features"], labels=batch["labels"])
             loss    = outputs.loss
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            accelerator.backward(loss)
+            accelerator.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
@@ -107,30 +102,31 @@ def main():
         all_preds, all_refs = [], []
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validating"):
-                input_features = batch["input_features"].to(DEVICE)
-                labels         = batch["labels"]
-                generated = model.generate(input_features, max_new_tokens=225,
+                generated = accelerator.unwrap_model(model).generate(
+                    batch["input_features"], max_new_tokens=225,
                     forced_decoder_ids=processor.get_decoder_prompt_ids(language=LANGUAGE, task=TASK))
                 preds = processor.batch_decode(generated, skip_special_tokens=True)
-                refs  = processor.batch_decode(torch.where(labels == -100,
-                    torch.tensor(processor.tokenizer.pad_token_id), labels), skip_special_tokens=True)
+                refs  = processor.batch_decode(torch.where(batch["labels"] == -100,
+                    torch.tensor(processor.tokenizer.pad_token_id), batch["labels"]), skip_special_tokens=True)
                 all_preds.extend(preds)
                 all_refs.extend(refs)
 
         wer = wer_metric.compute(predictions=all_preds, references=all_refs)
-        print(f"Epoch {epoch} | Loss: {avg_loss:.4f} | WER: {wer*100:.2f}%")
+        accelerator.print(f"Epoch {epoch} | Loss: {avg_loss:.4f} | WER: {wer*100:.2f}%")
 
         if wer < best_wer:
             best_wer = wer
-            model.save_pretrained(os.path.join(OUTPUT_DIR, "best_model"))
+            accelerator.unwrap_model(model).save_pretrained(os.path.join(OUTPUT_DIR, "best_model"))
             processor.save_pretrained(os.path.join(OUTPUT_DIR, "best_model"))
-            print(f"Best model saved! WER: {wer*100:.2f}%")
+            accelerator.print(f"Best model saved! WER: {wer*100:.2f}%")
 
+        accelerator.unwrap_model(model).save_pretrained(os.path.join(OUTPUT_DIR, f"checkpoint_epoch_{epoch:02d}"))
+        processor.save_pretrained(os.path.join(OUTPUT_DIR, f"checkpoint_epoch_{epoch:02d}"))
         train_stats.append({"epoch": epoch, "loss": round(avg_loss, 4), "wer": round(wer * 100, 2)})
 
     with open(os.path.join(OUTPUT_DIR, "train_stats.json"), "w") as f:
         json.dump(train_stats, f, indent=2)
-    print(f"Done! Best WER: {best_wer*100:.2f}%")
+    accelerator.print(f"Done! Best WER: {best_wer*100:.2f}%")
 
 if __name__ == "__main__":
     main()

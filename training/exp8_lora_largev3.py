@@ -5,15 +5,16 @@ from dataclasses import dataclass
 from torch.utils.data import Dataset, DataLoader
 from transformers import WhisperForConditionalGeneration, WhisperProcessor, get_linear_schedule_with_warmup, Adafactor
 from peft import LoraConfig, get_peft_model
+from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import evaluate
 
-MODEL_ID      = "openai/whisper-small"
+MODEL_ID      = "openai/whisper-large-v3"
 CLEANED_DIR   = "/workspace/whisper_nepali/data/cleaned"
 AUDIO_DIR     = "/workspace/whisper_nepali/data/raw/asr_nepali/data"
-OUTPUT_DIR    = "/workspace/whisper_nepali/models/exp5_whisper_small_lora"
+OUTPUT_DIR    = "/workspace/whisper_nepali/models/exp8_whisper_largev3_lora"
 SAMPLE_RATE   = 16000
-BATCH_SIZE    = 16
+BATCH_SIZE    = 4
 LEARNING_RATE = 1e-4
 NUM_EPOCHS    = 5
 WARMUP_STEPS  = 500
@@ -56,30 +57,52 @@ class DataCollator:
 
 def main():
     print("=" * 60)
-    print("Exp 5 - LoRA Fine-tune Whisper Small")
+    print("Exp 8 - LoRA Large v3 (Fast fp16)")
     print(f"Device: {DEVICE} | Batch: {BATCH_SIZE} | Epochs: {NUM_EPOCHS}")
     print("=" * 60)
 
     processor = WhisperProcessor.from_pretrained(MODEL_ID, language=LANGUAGE, task=TASK)
-    model     = WhisperForConditionalGeneration.from_pretrained(MODEL_ID)
+    model     = WhisperForConditionalGeneration.from_pretrained(
+        MODEL_ID, torch_dtype=torch.float16
+    )
     model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(language=LANGUAGE, task=TASK)
     model.config.suppress_tokens    = []
 
-    lora_config = LoraConfig(r=32, lora_alpha=64, target_modules=["q_proj", "v_proj"], lora_dropout=0.05, bias="none")
+    # Apply LoRA
+    lora_config = LoraConfig(
+        r=32, lora_alpha=64,
+        target_modules=["q_proj", "v_proj"],
+        lora_dropout=0.05, bias="none"
+    )
     model = get_peft_model(model, lora_config)
+    model.enable_input_require_grads()
+    model.gradient_checkpointing_enable()
+
+    # Keep LoRA params in fp32 for stable training
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            param.data = param.data.float()
+
     model = model.to(DEVICE)
-    print(f"Trainable: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    print(f"Trainable: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 
     collator     = DataCollator(processor=processor)
     train_ds     = NepaliASRDataset(os.path.join(CLEANED_DIR, "train.tsv"), AUDIO_DIR, processor)
     val_ds       = NepaliASRDataset(os.path.join(CLEANED_DIR, "val.tsv"),   AUDIO_DIR, processor)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,  collate_fn=collator, num_workers=4)
-    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False, collate_fn=collator, num_workers=4)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              collate_fn=collator, num_workers=4, pin_memory=True)
+    val_loader   = DataLoader(val_ds,   batch_size=BATCH_SIZE, shuffle=False,
+                              collate_fn=collator, num_workers=4, pin_memory=True)
     print(f"Train: {len(train_ds)} | Val: {len(val_ds)}")
 
-    optimizer   = Adafactor(model.parameters(), scale_parameter=False, relative_step=False, warmup_init=False, lr=LEARNING_RATE)
+    optimizer   = Adafactor(model.parameters(), scale_parameter=False,
+                            relative_step=False, warmup_init=False, lr=LEARNING_RATE)
     total_steps = len(train_loader) * NUM_EPOCHS
-    scheduler   = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=WARMUP_STEPS, num_training_steps=total_steps)
+    scheduler   = get_linear_schedule_with_warmup(optimizer,
+                    num_warmup_steps=WARMUP_STEPS, num_training_steps=total_steps)
+    scaler      = GradScaler()
 
     wer_metric  = evaluate.load("wer")
     best_wer    = float("inf")
@@ -89,31 +112,42 @@ def main():
         model.train()
         total_loss = 0
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS}")
+
         for batch in progress:
-            input_features = batch["input_features"].to(DEVICE)
+            input_features = batch["input_features"].to(DEVICE, dtype=torch.float16)
             labels         = batch["labels"].to(DEVICE)
-            outputs = model(input_features=input_features, labels=labels)
-            loss    = outputs.loss
-            loss.backward()
+
+            with autocast():
+                outputs = model(input_features=input_features, labels=labels)
+                loss    = outputs.loss
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
             optimizer.zero_grad()
+
             total_loss += loss.item()
             progress.set_postfix({"loss": f"{loss.item():.4f}"})
 
         avg_loss = total_loss / len(train_loader)
         model.eval()
         all_preds, all_refs = [], []
+
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validating"):
-                input_features = batch["input_features"].to(DEVICE)
+                input_features = batch["input_features"].to(DEVICE, dtype=torch.float16)
                 labels         = batch["labels"]
-                generated = model.generate(input_features, max_new_tokens=225,
-                    forced_decoder_ids=processor.get_decoder_prompt_ids(language=LANGUAGE, task=TASK))
+                generated = model.generate(
+                    input_features, max_new_tokens=225,
+                    forced_decoder_ids=processor.get_decoder_prompt_ids(language=LANGUAGE, task=TASK)
+                )
                 preds = processor.batch_decode(generated, skip_special_tokens=True)
                 refs  = processor.batch_decode(torch.where(labels == -100,
-                    torch.tensor(processor.tokenizer.pad_token_id), labels), skip_special_tokens=True)
+                    torch.tensor(processor.tokenizer.pad_token_id), labels),
+                    skip_special_tokens=True)
                 all_preds.extend(preds)
                 all_refs.extend(refs)
 
@@ -127,9 +161,9 @@ def main():
             print(f"Best model saved! WER: {wer*100:.2f}%")
 
         train_stats.append({"epoch": epoch, "loss": round(avg_loss, 4), "wer": round(wer * 100, 2)})
+        with open(os.path.join(OUTPUT_DIR, "train_stats.json"), "w") as f:
+            json.dump(train_stats, f, indent=2)
 
-    with open(os.path.join(OUTPUT_DIR, "train_stats.json"), "w") as f:
-        json.dump(train_stats, f, indent=2)
     print(f"Done! Best WER: {best_wer*100:.2f}%")
 
 if __name__ == "__main__":
