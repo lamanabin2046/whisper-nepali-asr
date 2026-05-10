@@ -1,0 +1,11 @@
+*.safetensors
+*.bin
+*.pt
+*.flac
+*.wav
+*.zip
+*.tar.gz
+__pycache__/
+*.pyc
+data/raw/
+models/
