@@ -9,10 +9,10 @@ from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
 import evaluate
 
-MODEL_ID      = "openai/whisper-large-v3"
+MODEL_ID      = "openai/whisper-large-v2"
 CLEANED_DIR   = "/workspace/whisper_nepali/data/cleaned"
 AUDIO_DIR     = "/workspace/whisper_nepali/data/raw/asr_nepali/data"
-OUTPUT_DIR    = "/workspace/whisper_nepali/models/exp8_whisper_largev3_lora"
+OUTPUT_DIR    = "/workspace/whisper_nepali/models/exp9_whisper_largev2_lora"
 SAMPLE_RATE   = 16000
 BATCH_SIZE    = 4
 LEARNING_RATE = 2e-5
@@ -57,8 +57,9 @@ class DataCollator:
 
 def main():
     print("=" * 60)
-    print("Exp 8 - LoRA Large v3 (Fast fp16)")
+    print("Exp 9 - LoRA Fine-tune Whisper Large v2")
     print(f"Device: {DEVICE} | Batch: {BATCH_SIZE} | Epochs: {NUM_EPOCHS}")
+    print(f"Rank: 16 | LR: {LEARNING_RATE}")
     print("=" * 60)
 
     processor = WhisperProcessor.from_pretrained(MODEL_ID, language=LANGUAGE, task=TASK)
@@ -68,7 +69,6 @@ def main():
     model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(language=LANGUAGE, task=TASK)
     model.config.suppress_tokens    = []
 
-    # Apply LoRA
     lora_config = LoraConfig(
         r=16, lora_alpha=32,
         target_modules=["q_proj", "v_proj"],
@@ -78,7 +78,6 @@ def main():
     model.enable_input_require_grads()
     model.gradient_checkpointing_enable()
 
-    # Keep LoRA params in fp32 for stable training
     for name, param in model.named_parameters():
         if param.requires_grad:
             param.data = param.data.float()
@@ -162,7 +161,12 @@ def main():
             processor.save_pretrained(os.path.join(OUTPUT_DIR, "best_model"))
             print(f"Best model saved! WER: {wer*100:.2f}%")
 
-        train_stats.append({"epoch": epoch, "loss": round(avg_loss, 4), "wer": round(wer * 100, 2), "cer": round(cer * 100, 2)})
+        train_stats.append({
+            "epoch": epoch,
+            "loss" : round(avg_loss, 4),
+            "wer"  : round(wer * 100, 2),
+            "cer"  : round(cer * 100, 2)
+        })
         with open(os.path.join(OUTPUT_DIR, "train_stats.json"), "w") as f:
             json.dump(train_stats, f, indent=2)
 
